@@ -51,6 +51,7 @@ import { projectComposerContextForProvider } from "@t3tools/shared/composerConte
 import { THEME_GUIDE } from "@t3tools/shared/themeCss";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
 import { buildCodexAdditionalContext } from "../../apps/server/src/provider/CodexDeveloperInstructions.ts";
+import { PULL_REQUEST_LINKING_INSTRUCTIONS } from "@t3tools/provider-core/server/runtimeInstructions";
 import { makeSideChatContext } from "../../apps/server/src/orchestration-v2/ContextHandoffService.ts";
 import { withInlineContext } from "../../apps/server/src/orchestration-v2/ContextHandoffDelivery.ts";
 import { AttachmentToolkit } from "../../apps/server/src/mcp/toolkits/attachment/tools.ts";
@@ -102,6 +103,7 @@ const MODELS = {
   "claude-opus-5-5": "Opus 5.5",
   "gpt-6.1-sol": "GPT-6.1 Sol",
   "gpt-6-astra": "GPT-6 Astra",
+  "gpt-6-luna": "GPT-6 Luna",
 } as const;
 type Model = keyof typeof MODELS;
 /** GPT models replay a Codex capture through CLIProxyAPI, the rest a Claude Code capture. */
@@ -109,7 +111,7 @@ const isCodex = (model: Model): model is Extract<Model, `gpt-${string}`> =>
   model.startsWith("gpt-");
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 // USD per million tokens. Cache writes use the 5-minute rate.
-const PRICES = {
+export const PRICES = {
   "claude-sonnet-5-5": { input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.2 },
   "claude-haiku-5-5": { input: 0.1, output: 0.5, cacheWrite: 0.125, cacheRead: 0.01 },
   "claude-opus-5-5": { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2 },
@@ -261,6 +263,10 @@ const McpToolUseWorld = Schema.StructWithRest(
   Schema.Struct({
     /** GitHub `owner/name`. Defaults to `acme/app`. */
     repo: Schema.optional(Schema.String),
+    /** `origin`'s host and path, such as `git.cafe/acme/app`. Defaults to `github.com/<repo>`. */
+    remote: Schema.optional(Schema.String),
+    /** The branch has commits but no upstream: T3's pull_request_create refuses until a push. */
+    unpushed: Schema.optional(Schema.Boolean),
     branch: Schema.optional(Schema.String),
     /** `git status --short` lines. */
     status: Schema.optional(Schema.String),
@@ -363,6 +369,11 @@ export const McpToolUseCase = Schema.Struct({
   /** Records for the context chips `prompt` links, projected as T3 sends them. */
   promptContext: Schema.optional(Schema.Struct({ records: Schema.Array(ComposerContextRecord) })),
   expect: McpToolUseExpect,
+  /**
+   * The checks for `--arm raw`, when its right outcome differs, as when only T3 can watch a PR.
+   * Otherwise both arms are graded on `expect`.
+   */
+  expectRaw: Schema.optional(McpToolUseExpect),
   /** Model calls this case may need. Overrides `--max-steps`. */
   maxSteps: Schema.optional(Schema.Number),
   source: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
@@ -538,13 +549,29 @@ const hiddenFromSubagents = enabledWhen(McpInvocationContext.hiddenFromSubagents
 const hiddenWhileLinksOff = enabledWhen(McpInvocationContext.hiddenWhileLinksOff);
 // T3 lists PR and CI tools only to a thread whose project is on a forge it reads.
 const hiddenWithoutForge = enabledWhen(McpInvocationContext.hiddenWithoutForge);
+/**
+ * `tools` is T3 as shipped. `raw` takes away T3's PR, CI and issue tools and their instructions,
+ * so the agent works the forge with CLIs alone, to measure what the tools save.
+ */
+export const ARMS = ["tools", "raw"] as const;
+export type Arm = (typeof ARMS)[number];
+const forgeToolNames = new Set(
+  [PullRequestsToolkit, IssuesToolkit].flatMap((toolkit) =>
+    Object.values(toolkit.tools).map((tool: Tool.Any) => `${T3_PREFIX}${tool.name}`),
+  ),
+);
+/** T3's text for an arm: `raw` drops the PR linking block that names T3's PR tools. */
+const forArm = (value: string, arm: Arm | undefined) =>
+  arm === "raw" ? value.replace(`\n\n${PULL_REQUEST_LINKING_INSTRUCTIONS}`, "") : value;
 const visibleT3Tools = (options: {
   readonly subagent?: boolean;
   readonly links?: boolean;
   readonly forge?: boolean;
+  readonly arm?: Arm;
 }) =>
   t3Tools.filter(
     (tool) =>
+      !(options.arm === "raw" && forgeToolNames.has(tool.name)) &&
       (options.links === true || !hiddenWhileLinksOff.has(tool.name)) &&
       (options.forge !== false || !hiddenWithoutForge.has(tool.name)) &&
       !(options.subagent === true && hiddenFromSubagents.has(tool.name)),
@@ -664,6 +691,7 @@ export const buildBase = (
     readonly deviceAccess?: boolean;
     /** false: the thread has no agent browser access, so T3's text leaves the browser out. */
     readonly browserAccess?: boolean;
+    readonly arm?: Arm;
   },
 ) => {
   const t3 = visibleT3Tools(options);
@@ -689,7 +717,7 @@ export const buildBase = (
   const { model } = options;
   const append = options.nativeSubagent
     ? ""
-    : t3SystemAppend(model, options.deviceAccess, options.browserAccess);
+    : forArm(t3SystemAppend(model, options.deviceAccess, options.browserAccess), options.arm);
   const modelLine = `You are powered by the model named ${MODELS[model]}. The exact model ID is ${model}.`;
   const joined = systemTexts.join("\n");
   // The capture's home directory names its user. Cases use `/home/user` paths instead.
@@ -759,6 +787,7 @@ const buildCodexBase = (
     readonly deviceAccess?: boolean;
     /** false: the thread has no agent browser access, so T3's text leaves the browser out. */
     readonly browserAccess?: boolean;
+    readonly arm?: Arm;
   },
 ): Base => {
   const t3 = visibleT3Tools(options);
@@ -797,7 +826,9 @@ const buildCodexBase = (
     { browser: options.browserAccess ?? true, device: options.deviceAccess ?? true },
   );
   input.push(
-    ...Object.entries(context).map(([key, entry]) => message(`<${key}>${entry.value}</${key}>`)),
+    ...Object.entries(context).map(([key, entry]) =>
+      message(`<${key}>${forArm(entry.value, options.arm)}</${key}>`),
+    ),
   );
   const nativeTools = input
     .flatMap((item) =>
@@ -1264,6 +1295,10 @@ const worldPullRequests = (sample: Sample) => {
   return Array.isArray(prs) ? prs.filter(isRecord) : [];
 };
 
+/** A world PR's `reviewThreads`: id, path, line, isResolved, comments of author and body. */
+const worldReviewThreads = (pr: Readonly<Record<string, unknown>> | undefined) =>
+  Array.isArray(pr?.reviewThreads) ? pr.reviewThreads.filter(isRecord) : [];
+
 /** World fixtures spell states as GitHub does (`MERGED`) or as T3 does (`merged`). */
 const worldState = (pr: Readonly<Record<string, unknown>> | undefined) => {
   const state = valueText(pr?.state ?? "open").toLowerCase();
@@ -1460,14 +1495,14 @@ export const t3Default = (
                     : number === own.number
                       ? (sample.testCase.setup.world?.commits?.[0]?.sha ?? null)
                       : null,
-                mergeability: "mergeable",
-                behindBy: 0,
+                mergeability: valueText(world?.mergeability ?? "mergeable"),
+                behindBy: typeof world?.behindBy === "number" ? world.behindBy : 0,
                 autoMergeEnabled: false,
                 additions: 1,
                 deletions: 1,
                 changedFiles: 1,
                 labels: [],
-                reviewers: [],
+                reviewers: Array.isArray(world?.reviewers) ? world.reviewers.map(valueText) : [],
               },
             }
           : {}),
@@ -1503,8 +1538,28 @@ export const t3Default = (
                     path: null,
                     reviewState: null,
                   })),
-                reviewThreads: [],
-                hiddenResolvedThreads: 0,
+                reviewThreads: worldReviewThreads(world)
+                  .filter((thread) => input.includeResolved === true || thread.isResolved !== true)
+                  .map((thread) => ({
+                    id: valueText(thread.id),
+                    path: valueText(thread.path),
+                    line: typeof thread.line === "number" ? thread.line : null,
+                    isResolved: thread.isResolved === true,
+                    isOutdated: false,
+                    comments: (Array.isArray(thread.comments) ? thread.comments : [])
+                      .filter(isRecord)
+                      .map((comment) => ({
+                        author: valueText(comment.author),
+                        body: valueText(comment.body),
+                        createdAt: "2026-10-27T10:00:00Z",
+                      })),
+                    moreComments: false,
+                  })),
+                hiddenResolvedThreads:
+                  input.includeResolved === true
+                    ? 0
+                    : worldReviewThreads(world).filter((thread) => thread.isResolved === true)
+                        .length,
                 truncated: false,
                 nextCursor: null,
               },
@@ -1876,7 +1931,7 @@ export const shellRequest = (sample: Sample, call: Omit<ShellEntry, "output">, m
   const command = call.tool === "Bash" && isRecord(call.input) ? call.input.command : undefined;
   const mocks = shellMocksFor(sample, typeof command === "string" ? command : undefined);
   const machine = [
-    `Working directory: ${cwd} on ${platform}, a git checkout of github.com/${repo}.${date ? ` Today is ${date}.` : ""}`,
+    `Working directory: ${cwd} on ${platform}, a git checkout of ${world?.remote ?? `github.com/${repo}`}.${date ? ` Today is ${date}.` : ""}`,
     gitStatus(testCase),
     `World: ${valueText(world ?? {})}`,
     ...(mocks.length > 0
@@ -2054,6 +2109,36 @@ const recordForgeChange = (
   }
 };
 
+/** A shell command in this sample pushed the branch, so it has an upstream. */
+const pushed = (sample: Sample) =>
+  sample.shell.some(
+    (entry) =>
+      entry.tool === "Bash" &&
+      isRecord(entry.input) &&
+      /\bgit\s+push\b/.test(valueText(entry.input.command)) &&
+      !/^Exit code [1-9]/.test(entry.output),
+  );
+
+/**
+ * Refusals the real tools give for this world, so the tools arm meets the same walls as the CLI.
+ * Messages are PullRequestService's and GitManager's.
+ */
+const productRefusal = (sample: Sample, name: string, input: Readonly<Record<string, unknown>>) => {
+  const world = sample.testCase.setup.world;
+  if (name === "pull_request_create" && world?.unpushed === true && !pushed(sample)) {
+    return "Current branch has not been pushed. Push before creating a PR.";
+  }
+  if (name === "pull_request_merge" && typeof input.expectedHeadSha === "string") {
+    const number = input.number ?? branchPullRequest(sample).number;
+    const pr = worldPullRequests(sample).find((candidate) => Number(candidate.number) === number);
+    const head = typeof pr?.headRefOid === "string" ? pr.headRefOid : undefined;
+    if (head !== undefined && head !== input.expectedHeadSha.trim()) {
+      return `The head is now ${head}, not ${input.expectedHeadSha}. Review the new commits first.`;
+    }
+  }
+  return undefined;
+};
+
 export const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(function* (
   sample: Sample,
   config: Config,
@@ -2124,6 +2209,12 @@ export const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(fun
   if (sample.backgroundWait && isT3Name(call.name) && name === "t3_background_wait" && fromWorld) {
     const result = yield* sample.backgroundWait(input);
     return result.isError ? failed(result.text) : toolResult(call.id, result.text);
+  }
+  // `{"$error": "..."}` fails the call with that text, as T3 reports a forge error.
+  if (isRecord(mock) && typeof mock.$error === "string") return failed(mock.$error);
+  if (isT3Name(call.name)) {
+    const refused = productRefusal(sample, name, input);
+    if (refused !== undefined) return failed(refused);
   }
   // A pasted secret is saved without a card, so a mocked card outcome does not apply.
   if (mock !== undefined && mock !== "default" && !pastedSecret(name, input)) {
@@ -2927,6 +3018,7 @@ const Flags = Schema.Struct({
     ...PROXY_SHELL_MODELS,
   ]),
   "user-instructions": Schema.Literals(["keep", "drop"]),
+  arm: Schema.Literals(ARMS),
   "dry-run": Schema.Boolean,
   "stop-on-regression": Schema.Boolean,
   "regression-budget": Schema.optional(PositiveIntOrZero),
@@ -2967,6 +3059,8 @@ const main = Effect.gen(function* () {
       "shell-model": { ...string, default: "claude-haiku-5-5" },
       // T3's text must work for every user, so the captured CLAUDE.md is dropped by default.
       "user-instructions": { ...string, default: "drop" },
+      // `raw` runs without T3's PR, CI and issue tools, to compare against the CLIs.
+      arm: { ...string, default: "tools" },
       "dry-run": { type: "boolean", default: false },
       "stop-on-regression": { type: "boolean", default: false },
       "regression-budget": string,
@@ -3022,6 +3116,7 @@ const main = Effect.gen(function* () {
       );
       return {
         ...testCase,
+        expect: flags.arm === "raw" ? (testCase.expectRaw ?? testCase.expect) : testCase.expect,
         setup: {
           ...testCase.setup,
           priorTurns,
@@ -3058,6 +3153,7 @@ const main = Effect.gen(function* () {
               forge,
               deviceAccess,
               browserAccess,
+              arm: flags.arm,
             }),
           ),
         )
@@ -3072,6 +3168,7 @@ const main = Effect.gen(function* () {
               forge,
               deviceAccess,
               browserAccess,
+              arm: flags.arm,
             });
             return role === "native-subagent"
               ? Effect.promise(() =>
@@ -3159,7 +3256,7 @@ const main = Effect.gen(function* () {
   const inFlight = yield* Semaphore.make(flags.concurrency);
   const runOne = (testCase: McpToolUseCase) => {
     const { id, kind, pattern } = testCase;
-    const identity = { id, kind, pattern, role: testCase.setup.role };
+    const identity = { id, kind, pattern, role: testCase.setup.role, arm: flags.arm };
     const usage = { usage: emptyUsage(), shellUsage: emptyUsage() };
     const privateValues = [config.apiKey, ...Object.values(config.proxy?.headers ?? {})]
       .flatMap((value) => [value, value.replace(/^Bearer /i, "")])
@@ -3234,7 +3331,7 @@ const main = Effect.gen(function* () {
     { concurrency: flags.concurrency, discard: true },
   ).pipe(Effect.ignore);
   const samples = flags.samples === undefined ? "2-3 (adaptive)" : flags.samples;
-  const header = `Commit \`${commit}\`, ${flags.model} at ${effort} effort, user instructions ${flags["user-instructions"]}, ${samples} samples per case, template \`${path.basename(templatePath)}\``;
+  const header = `Commit \`${commit}\`, ${flags.model} at ${effort} effort, user instructions ${flags["user-instructions"]}, arm ${flags.arm}, ${samples} samples per case, template \`${path.basename(templatePath)}\``;
   const finished = new Set(rows.map((row) => row.id)).size;
   const stopped =
     regressions.length === 0

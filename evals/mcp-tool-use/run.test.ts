@@ -1324,6 +1324,72 @@ it.effect("reads the branch's PR only once the agent has opened it", () =>
   }).pipe(Effect.provide(FetchHttpClient.layer)),
 );
 
+it.effect("the raw arm drops T3's forge tools and text; both arms meet T3's refusals", () =>
+  Effect.gen(function* () {
+    const tools = buildBase(template, { model: "claude-sonnet-5-5", keepUserInstructions: false });
+    const raw = buildBase(template, {
+      model: "claude-sonnet-5-5",
+      keepUserInstructions: false,
+      arm: "raw",
+    });
+    const names = (base: typeof tools) => base.t3.map((tool) => tool.name);
+    assert.include(names(tools), "mcp__t3-code__pull_request_read");
+    assert.notInclude(names(raw), "mcp__t3-code__pull_request_read");
+    assert.notInclude(names(raw), "mcp__t3-code__link_issue");
+    assert.include(names(raw), "mcp__t3-code__delegate_task");
+    assert.include(JSON.stringify(tools.system), "<pull_request_linking>");
+    assert.notInclude(JSON.stringify(raw.system), "<pull_request_linking>");
+
+    const head = "c3a91f27d0b84e6a95f1c2d3e4b5a6978d0c1e2f";
+    const world = {
+      ...childCase.setup.world,
+      branch: "feature",
+      unpushed: true,
+      prs: [{ number: 7, headRefName: "other", headRefOid: head }],
+    };
+    const mocks = { ci_rerun: { $error: "GitHub API rate limit exceeded." } };
+    const setup = { ...childCase.setup, role: "top" as const, priorTurns: [], world, mocks };
+    const sample = makeSample({ ...childCase, setup }, tools);
+    for (const name of ["pull_request_create", "pull_request_merge", "ci_rerun"]) {
+      sample.tools.push({ name: `mcp__t3-code__${name}` });
+    }
+    const config = {
+      apiKey: "",
+      model: "claude-sonnet-5-5",
+      effort: "high",
+      maxSteps: 6,
+      shellModel: "claude-haiku-5-5",
+    } as const;
+    const call = (id: string, name: string, input: Record<string, unknown>) =>
+      answerToolCall(sample, config, {
+        type: "tool_use",
+        id,
+        name: `mcp__t3-code__${name}`,
+        input,
+      });
+    const create = { title: "Feature", body: "Body" };
+    const refused = yield* call("a", "pull_request_create", create);
+    assert.isTrue(refused.is_error);
+    assert.include(String(refused.content), "has not been pushed");
+    sample.shell.push({
+      tool: "Bash",
+      input: { command: "git push -u origin feature" },
+      output: "",
+    });
+    assert.isNotTrue((yield* call("b", "pull_request_create", create)).is_error);
+
+    const short = yield* call("c", "pull_request_merge", { number: 7, expectedHeadSha: "c3a91f2" });
+    assert.isTrue(short.is_error);
+    assert.include(String(short.content), `The head is now ${head}`);
+    const full = yield* call("d", "pull_request_merge", { number: 7, expectedHeadSha: head });
+    assert.isNotTrue(full.is_error);
+
+    const mocked = yield* call("e", "ci_rerun", { number: 7 });
+    assert.isTrue(mocked.is_error);
+    assert.include(String(mocked.content), "rate limit");
+  }).pipe(Effect.provide(FetchHttpClient.layer)),
+);
+
 it.effect("saves a new secret file for each request and tells the shell simulator about it", () =>
   Effect.gen(function* () {
     const base = buildBase(template, { model: "claude-sonnet-5-5", keepUserInstructions: false });

@@ -824,7 +824,20 @@ describe("source control tools", () => {
     changedFiles: 1,
     labels: [],
     reviewers: [],
-    checks: [{ name: "CI", status: "success", description: null, url: null }],
+    checks: [
+      { name: "CI", status: "success", description: null, url: null },
+      { name: "Lint", status: "failure", description: null, url: null },
+      { name: "E2E", status: "cancelled", description: null, url: null },
+      { name: "Deploy", status: "pending", description: null, url: null },
+      {
+        name: "Approval",
+        status: "action-required",
+        description: null,
+        url: null,
+        placeholder: true,
+      },
+      { name: "Docs", status: "skipped", description: null, url: null },
+    ],
   } as unknown as PullRequestDetail;
   const reviewThread = (id: string, isResolved: boolean) => ({
     id,
@@ -843,7 +856,7 @@ describe("source control tools", () => {
     commits: [],
   };
 
-  it.effect("reads the thread's branch PR, only the sections asked, without resolved threads", () =>
+  it.effect("reads the thread's branch PR compactly, adding only the sections asked", () =>
     Effect.gen(function* () {
       const asked: Array<PullRequestRef> = [];
       const harness = yield* makeHarness({
@@ -853,24 +866,29 @@ describe("source control tools", () => {
           activity: () => Effect.succeed(activity),
         },
       });
-      const result = yield* harness.call("pull_request_read", {
-        sections: ["summary", "conversation"],
+      const compact = yield* harness.call("pull_request_read", {});
+      expect(compact).toMatchObject({
+        headSha: "abc123",
+        checks: { passed: 2, pending: 2, failed: ["Lint", "E2E"] },
+        unresolvedThreads: 1,
       });
-      expect(asked).toEqual([
-        {
-          projectId: PROJECT_ID,
-          host: "github.com",
-          repository: "t3tools/t3code",
-          number: 42,
-          allowStale: false,
-        },
-      ]);
-      expect(result.summary?.headSha).toBe("abc123");
-      expect(result.checks).toBeUndefined();
-      expect(result.conversation?.reviewThreads.map((thread) => thread.id)).toEqual([
+      expect(compact.body).toBeUndefined();
+      expect(compact.checkRuns).toBeUndefined();
+      expect(compact.conversation).toBeUndefined();
+      const result = yield* harness.call("pull_request_read", { include: ["body", "threads"] });
+      expect(asked[1]).toEqual({
+        projectId: PROJECT_ID,
+        host: "github.com",
+        repository: "t3tools/t3code",
+        number: 42,
+        allowStale: false,
+      });
+      expect(result.body).toBe("Adds tools.");
+      expect(result.checkRuns).toBeUndefined();
+      expect(result.conversation?.comments).toBeUndefined();
+      expect(result.conversation?.reviewThreads?.map((thread) => thread.id)).toEqual([
         "open-thread",
       ]);
-      expect(result.conversation?.hiddenResolvedThreads).toBe(1);
     }),
   );
 
@@ -887,6 +905,7 @@ describe("source control tools", () => {
       const harness = yield* makeHarness({
         thread: branchThread,
         pullRequests: {
+          detail: () => Effect.succeed(detail),
           activity: () =>
             Effect.sync(() => ({
               ...activity,
@@ -919,7 +938,7 @@ describe("source control tools", () => {
             ),
         },
       });
-      const first = yield* harness.call("pull_request_read", { sections: ["conversation"] });
+      const first = yield* harness.call("pull_request_read", { include: ["threads"] });
       expect(first.conversation?.reviewThreads).toMatchObject([
         { id: "first", moreComments: false, comments: [{}, { body: "reply" }] },
       ]);
@@ -928,12 +947,12 @@ describe("source control tools", () => {
       // The agent resolves what it read; the next page still starts at the next thread.
       firstResolved = true;
       const second = yield* harness.call("pull_request_read", { cursor: cursor! });
-      expect(second.summary).toBeUndefined();
-      expect(second.conversation?.reviewThreads.map((thread) => thread.id)).toEqual(["second"]);
+      expect(second.conversation?.comments).toBeUndefined();
+      expect(second.conversation?.reviewThreads?.map((thread) => thread.id)).toEqual(["second"]);
       expect(second.conversation?.nextCursor).toBeNull();
       // A cursor past the current end finishes instead of repeating an empty page.
       const stale = Base64Url.encode(
-        JSON.stringify({ threads: 99, comments: 99, includeResolved: false }),
+        JSON.stringify({ threads: 99, comments: null, includeResolved: false }),
       );
       const past = yield* harness.call("pull_request_read", { cursor: stale });
       expect(past.conversation).toMatchObject({ reviewThreads: [], nextCursor: null });
@@ -968,10 +987,11 @@ describe("source control tools", () => {
           pullRequests: {
             summary: () => Effect.succeed({ state: "open", headBranch } as never),
             detail: (ref) => Effect.sync(() => asked.push(ref)).pipe(Effect.as(detail)),
+            activity: () => Effect.succeed(activity),
           },
         });
       const harness = yield* opened("tools");
-      yield* harness.call("pull_request_read", { sections: ["summary"] });
+      yield* harness.call("pull_request_read", {});
       expect(asked).toMatchObject([{ number: 43 }]);
 
       // Before sync, the host says which branch it came from; another branch's is not this one.

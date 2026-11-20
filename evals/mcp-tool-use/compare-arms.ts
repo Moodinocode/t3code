@@ -1,20 +1,35 @@
 #!/usr/bin/env node
 // @effect-diagnostics nodeBuiltinImport:off globalConsole:off
 /**
- * Compares runs of the same cases with `--arm tools` and `--arm raw`: `pnpm mcp-tool-use:compare
- * <results.jsonl>... [--model <id>]` prints, per case and arm, the pass rate and what a sample
- * spent on the forge: calls, failed calls, result bytes, requested sleep, and tokens and cost.
- * Rows with an error are skipped. Agent cost is priced only for Claude models.
+ * `pnpm mcp-tool-use:compare <results.jsonl>... [--model <id>]`: per case and arm, pass rate and
+ * forge spend. Rows are regraded with this checkout's cases. Cache writes are priced as reads, so
+ * run order does not pick the cheaper arm; only Claude agents are priced.
  */
 import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 
-import { PRICES } from "./run.ts";
+import * as Schema from "effect/Schema";
+
+import { gradeSample, McpToolUseCase, pastedText, PRICES, worldFilePaths } from "./run.ts";
 
 const { values, positionals } = NodeUtil.parseArgs({
   allowPositionals: true,
-  options: { model: { type: "string", default: "claude-sonnet-5-5" } },
+  options: {
+    model: { type: "string", default: "claude-sonnet-5-5" },
+    cases: {
+      type: "string",
+      default: new URL("./cases/pr-tools-vs-cli.ndjson", import.meta.url).pathname,
+    },
+  },
 });
+const decodeCase = Schema.decodeUnknownSync(Schema.fromJsonString(McpToolUseCase));
+const cases = new Map(
+  NodeFS.readFileSync(values.cases, "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => decodeCase(line))
+    .map((testCase) => [testCase.id, testCase]),
+);
 
 type Usage = { input: number; output: number; cacheWrite: number; cacheRead: number };
 type Call = { step: number; tool: string; input: unknown; failed?: boolean; output?: string };
@@ -46,7 +61,7 @@ const price = (usage: Usage, model: string) => {
   return (
     (usage.input * rates.input +
       usage.output * rates.output +
-      usage.cacheWrite * rates.cacheWrite +
+      usage.cacheWrite * rates.cacheRead +
       usage.cacheRead * rates.cacheRead) /
     1e6
   );
@@ -57,7 +72,19 @@ const rows: Array<Row> = positionals.flatMap((file) =>
     .split("\n")
     .filter((line) => line.trim() !== "")
     .map((line) => JSON.parse(line) as Row)
-    .filter((row) => row.error === undefined),
+    .filter((row) => row.error === undefined)
+    .map((row) => {
+      const testCase = cases.get(row.id);
+      if (testCase === undefined) return row;
+      const expect = row.arm === "raw" ? (testCase.expectRaw ?? testCase.expect) : testCase.expect;
+      const checks = gradeSample(
+        expect,
+        row as unknown as Parameters<typeof gradeSample>[1],
+        pastedText(testCase),
+        worldFilePaths(testCase),
+      );
+      return { ...row, pass: checks.every((check) => check.pass) };
+    }),
 );
 
 type Stats = {
@@ -139,8 +166,10 @@ console.log("\n## All cases\n");
 console.log(
   `${header.replace("| case ", "")}\n| --- | ${Array.from({ length: 9 }, () => "---").join(" | ")} |`,
 );
-for (const [arm, stats] of [...totals].toSorted(([a], [b]) => b.localeCompare(a))) {
-  const perPass = stats.pass === 0 ? "-" : `$${(stats.cost / stats.pass).toFixed(3)}`;
-  console.log(`| ${arm} | ${cells(stats)} |`);
-  if (!Number.isNaN(stats.cost)) console.log(`\n- ${arm}: cost per passing sample ${perPass}`);
+const arms = [...totals].toSorted(([a], [b]) => b.localeCompare(a));
+for (const [arm, stats] of arms) console.log(`| ${arm} | ${cells(stats)} |`);
+console.log("");
+for (const [arm, stats] of arms) {
+  if (Number.isNaN(stats.cost) || stats.pass === 0) continue;
+  console.log(`- ${arm}: cost per passing sample $${(stats.cost / stats.pass).toFixed(3)}`);
 }

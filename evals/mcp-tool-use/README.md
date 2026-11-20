@@ -290,6 +290,45 @@ Passes per case, main's runtime text (3 samples) → this branch's "Link every o
 
 After the change, the first reference to a file is an absolute link. The remaining failures come from two other kinds of span. Some repeat the file later as relative inline code (Sonnet's other-checkout failures). Others quote values rather than cite files, such as `main` set to `src/index.ts` or the import `./ws`. Chat still turns those spans into pills.
 
+## PR tools vs raw CLIs
+
+`cases/pr-tools-vs-cli.ndjson` asks whether T3's PR, CI and issue tools pay for the context they add. Each case is a forge task from a real failure in 2026-09/11 Claude and Codex sessions. `--arm raw` removes those tools and the `<pull_request_linking>` instructions, so the agent has only `gh`, `cafe` and the shell. `--arm tools` (the default) is T3 as shipped. Run both arms on the same model and compare:
+
+```sh
+pnpm mcp-tool-use --arm tools --cases mcp-tool-use/cases/pr-tools-vs-cli.ndjson --samples 3 --out runs/tools
+pnpm mcp-tool-use --arm raw --cases mcp-tool-use/cases/pr-tools-vs-cli.ndjson --samples 3 --out runs/raw
+pnpm mcp-tool-use:compare runs/tools/results.jsonl runs/raw/results.jsonl
+```
+
+`compare` regrades every row with this checkout's cases and prints, per case and arm: pass rate, model calls, forge calls (T3 forge tools plus `gh`/`cafe`/`glab`/`src` commands), failed forge calls, forge output in KB, requested sleep, `--help` calls, tokens and cost. Cost charges cache writes as cache reads, so the order the runs went in doesn't decide which arm looks cheaper.
+
+Both arms see the same world. Shell mocks apply to either arm's commands, so an agent in the tools arm that reaches for `gh` hits the same rate limit. Where the real tools refuse, the tools arm is refused too: `world.unpushed` makes `pull_request_create` fail until a `git push`, and `pull_request_merge` compares `expectedHeadSha` with the full head, as `PullRequestService` does. A `{"$error": "..."}` mock fails any T3 tool with that text. `expectRaw` grades the raw arm when its right outcome differs: only T3 can watch a PR, so the raw arm passes `cli-babysit-green` by waiting on the checks.
+
+Some cases are capability cases rather than mistake cases:
+
+- `cli-rate-limited-read` and `cli-auth-missing` assume T3 is signed in through the T3 Code for GitHub app, whose quota and token are separate from `gh`'s.
+- The git.cafe cases come in two forms. The plain ones say nothing about the forge. The `-instructed` ones put "use cafe" in the project instructions, as a maintained AGENTS.md would.
+
+### Results
+
+Sonnet 5.5, 3 samples per case and arm, 2026-11-20. "tools+fixes" is the tools arm with [#39899](https://github.com/pingdotgg/t3code/pull/39899), [#39901](https://github.com/pingdotgg/t3code/pull/39901), [#39903](https://github.com/pingdotgg/t3code/pull/39903) and [#39906](https://github.com/pingdotgg/t3code/pull/39906) applied. Means per sample, with cost at warm-cache prices.
+
+| Arm         | Pass  | Model calls | Forge calls | Failed forge calls | Ktokens | Cost per pass |
+| ----------- | ----- | ----------- | ----------- | ------------------ | ------- | ------------- |
+| raw         | 35/42 | 2.8         | 2.1         | 0.4                | 86      | $0.032        |
+| tools       | 42/42 | 2.8         | 1.6         | 0.0                | 90      | $0.025        |
+| tools+fixes | 42/42 | 2.5         | 1.5         | 0.0                | 83      | $0.022        |
+
+The raw arm's 7 misses:
+
+- 3 rate-limit samples. They are honest reports that `gh` was out of quota.
+- 3 samples of the uninstructed git.cafe review case. The agent never found `cafe`.
+- 1 sample of the uninstructed git.cafe CI case.
+
+With "use cafe" in the instructions, both arms pass the git.cafe cases at about the same cost. On the tasks both arms can finish, the tools save about a quarter of the forge calls and every failed call. On one-line questions (`cli-control-title`) and plain merges they cost one extra model call to load the deferred schema. The fixed overhead on Claude is about 530 tokens per request: the linking block plus the deferred tool names.
+
+Limits: the shell is simulated, so a CLI's output is the simulator's reading of the world and of the error texts the cases copy from real sessions. Polling never really waits, so these runs measure what polling decides, not the wall-clock time it takes.
+
 ## Where T3's text lives
 
 - `packages/provider-core/src/server/runtimeInstructions.ts`

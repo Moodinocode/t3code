@@ -311,23 +311,39 @@ Some cases are capability cases rather than mistake cases:
 
 ### Results
 
-Sonnet 5.5, 3 samples per case and arm, 2026-11-20. "tools+fixes" is the tools arm with [#39899](https://github.com/pingdotgg/t3code/pull/39899), [#39901](https://github.com/pingdotgg/t3code/pull/39901), [#39903](https://github.com/pingdotgg/t3code/pull/39903) and [#39906](https://github.com/pingdotgg/t3code/pull/39906) applied. Means per sample, with cost at warm-cache prices.
+3 samples per case and arm, 2026-11-20, on T3 as of `6d6ca60` ("tools"). Codex models ran through CLIProxyAPI with `gpt-6.1-terra` as the shell. "Both can finish" leaves out the capability cases: rate limit, gh signed out, waiting on checks, and the uninstructed git.cafe cases. Means per sample; Sonnet cost is at warm-cache prices.
 
-| Arm         | Pass  | Model calls | Forge calls | Failed forge calls | Ktokens | Cost per pass |
-| ----------- | ----- | ----------- | ----------- | ------------------ | ------- | ------------- |
-| raw         | 35/42 | 2.8         | 2.1         | 0.4                | 86      | $0.032        |
-| tools       | 42/42 | 2.8         | 1.6         | 0.0                | 90      | $0.025        |
-| tools+fixes | 42/42 | 2.5         | 1.5         | 0.0                | 83      | $0.022        |
+| Model       | Arm   | Pass  | Model calls | Forge calls | Failed forge calls | Ktokens | Both can finish: pass, ktokens |
+| ----------- | ----- | ----- | ----------- | ----------- | ------------------ | ------- | ------------------------------ |
+| Sonnet 5.5  | raw   | 34/42 | 2.5         | 2.0         | 0.4                | 81      | 27/27, 79                      |
+| Sonnet 5.5  | tools | 42/42 | 2.8         | 1.6         | 0.0                | 90      | 27/27, 89                      |
+| GPT-6 Luna  | raw   | 31/40 | 6.5         | 4.1         | 1.0                | 147     | 24/26, 109                     |
+| GPT-6 Luna  | tools | 41/42 | 3.6         | 1.7         | 0.0                | 91      | 26/27, 97                      |
+| GPT-6.1 Sol | raw   | 30/41 | 5.3         | 4.4         | 1.0                | 122     | 27/27, 92                      |
+| GPT-6.1 Sol | tools | 42/42 | 3.5         | 2.4         | 0.0                | 89      | 27/27, 99                      |
 
-The raw arm's 7 misses:
+Errored samples are left out.
 
-- 3 rate-limit samples. They are honest reports that `gh` was out of quota.
-- 3 samples of the uninstructed git.cafe review case. The agent never found `cafe`.
-- 1 sample of the uninstructed git.cafe CI case.
+**Where the tools win:**
 
-With "use cafe" in the instructions, both arms pass the git.cafe cases at about the same cost. On the tasks both arms can finish, the tools save about a quarter of the forge calls and every failed call. On one-line questions (`cli-control-title`) and plain merges they cost one extra model call to load the deferred schema. The fixed overhead on Claude is about 530 tokens per request: the linking block plus the deferred tool names.
+- **They never failed a forge call.** The raw arm failed one call per sample on Codex and 0.4 on Sonnet.
+- **Capability cases.**
+  - The raw arm cannot read checks while `gh` is rate-limited: 0–1 of 3 passed per model.
+  - It never found `cafe` on a git.cafe repo whose instructions don't name it: 0/3 on review comments for all three models.
+  - GPT-6.1 Sol's raw arm said "I'll check every minute" with nothing running, so it never reported green checks: 0/2.
+  - GPT-6 Luna's raw arm polled for 18 model calls on average.
+- **On Codex, total tokens.** The tools cut them by 38% on Luna and 27% on Sol.
 
-Limits: the shell is simulated, so a CLI's output is the simulator's reading of the world and of the error texts the cases copy from real sessions. Polling never really waits, so these runs measure what polling decides, not the wall-clock time it takes.
+**Where it's even, or raw wins:**
+
+- **Tasks both arms can finish.** Sonnet and Sol pass every sample either way, at similar tokens; raw is about 10% lower.
+- **One-line questions and plain merges.** The tools cost one extra model call to load the deferred schema.
+- **Fixed overhead.** On Claude it is about 530 tokens per request: the linking block plus the deferred tool names.
+- **git.cafe with "use cafe" in the project instructions.** Both arms pass at similar cost.
+
+**With the fixes.** "tools+fixes" (Sonnet, earlier git.cafe world) applied [#39899](https://github.com/pingdotgg/t3code/pull/39899), [#39901](https://github.com/pingdotgg/t3code/pull/39901), [#39903](https://github.com/pingdotgg/t3code/pull/39903) and [#39906](https://github.com/pingdotgg/t3code/pull/39906). It passed 42/42 with 2.5 model calls and 83 ktokens per sample, against 2.8 and 90 for "tools" on the same cases.
+
+Limits: the shell is simulated, so a CLI's output is the simulator's reading of the world and of the error texts the cases copy from real sessions. Polling never really waits, so these runs measure what polling decides, not the wall-clock time it takes. The simulator also sees the whole world, and early runs leaked it into invented files, such as an AGENTS.md naming `cafe` or a Forgejo API on git.cafe. The git.cafe worlds now rule both out. Read failing and passing transcripts before you trust a new case.
 
 ## Where T3's text lives
 
